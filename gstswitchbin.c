@@ -635,6 +635,9 @@ static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitc
 				ret = FALSE;
 				goto finish;
 			}
+
+			/* Deactivate the drop probe in case it was activated previously */
+			gst_switch_bin_set_sinkpad_drop(switch_bin, FALSE);
 		}
 		else
 		{
