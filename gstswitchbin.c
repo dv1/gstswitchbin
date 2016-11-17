@@ -699,7 +699,7 @@ static GstCaps* gst_switch_bin_get_allowed_caps(GstSwitchBin *switch_bin, G_GNUC
 	/* must be called with path lock held */
 
 	guint i;
-	GstCaps *total_path_caps = gst_caps_new_empty();
+	GstCaps *total_path_caps;
 
 	/* The allowed caps are a combination of the caps of all paths, the
 	 * filter caps, and the allowed caps as indicated by the result
@@ -720,6 +720,8 @@ static GstCaps* gst_switch_bin_get_allowed_caps(GstSwitchBin *switch_bin, G_GNUC
 		GST_ELEMENT_ERROR(switch_bin, STREAM, FAILED, ("no paths defined"), ("there must be at least one path in order for switchbin to do anything"));
 		return NULL;
 	}
+
+	total_path_caps = gst_caps_new_empty();
 
 	for (i = 0; i < switch_bin->num_paths; ++i)
 	{
