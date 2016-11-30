@@ -374,6 +374,7 @@ static gboolean gst_switch_bin_handle_query(GstPad *pad, GstObject *parent, GstQ
 			{
 				GST_DEBUG_OBJECT(switch_bin, "%s caps query:  caps: %" GST_PTR_FORMAT, pad_name, (gpointer)caps);
 				gst_query_set_caps_result(query, caps);
+				gst_caps_unref(caps);
 				return TRUE;
 			}
 			else
