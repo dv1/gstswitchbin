@@ -88,8 +88,12 @@ static gboolean gst_switch_bin_src_query(GstPad *pad, GstObject *parent, GstQuer
 
 static gboolean gst_switch_bin_set_num_paths(GstSwitchBin *switch_bin, guint new_num_paths);
 static gboolean gst_switch_bin_select_path_for_caps(GstSwitchBin *switch_bin, GstCaps *caps);
+static gboolean gst_switch_bin_select_path_for_tags(GstSwitchBin *switch_bin, GstTagList *tags);
+
 static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitchBinPath *switch_bin_path);
 static GstSwitchBinPath* gst_switch_bin_find_matching_path(GstSwitchBin *switch_bin, GstCaps const *caps);
+
+static GstSwitchBinPath* gst_switch_bin_find_matching_path_tags(GstSwitchBin *switch_bin, GstTagList const *tags);
 
 static void gst_switch_bin_set_sinkpad_block(GstSwitchBin *switch_bin, gboolean do_block);
 static GstPadProbeReturn gst_switch_bin_blocking_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
@@ -190,6 +194,7 @@ static void gst_switch_bin_init(GstSwitchBin *switch_bin)
 	switch_bin->num_paths = DEFAULT_NUM_PATHS;
 	switch_bin->paths = NULL;
 	switch_bin->current_path = NULL;
+	switch_bin->path_selected_by_tag = FALSE;
 	switch_bin->last_stream_start = NULL;
 	switch_bin->blocking_probe_id = 0;
 	switch_bin->drop_probe_id = 0;
@@ -288,6 +293,22 @@ static gboolean gst_switch_bin_sink_event(GstPad *pad, GstObject *parent, GstEve
 			GST_DEBUG_OBJECT(switch_bin, "stream-start event observed; copying it for later use");
 			gst_event_replace(&(switch_bin->last_stream_start), event);
 
+			/* Force a path reselection. When a path was selected by tags,
+			 * it would stay selected beyond transition to a next stream
+			 * (marked by the stream-start event) in case of unchanged caps.
+			 * This is because a non-presence of tags is not detected. And
+			 * this in turn can cause problems if for example the previous
+			 * stream did have tags that cause a switch to path #1, but the
+			 * next stream has no tags at all, and should switch to path #0.
+			 * Fix this by forcing a reselection here. */
+			PATH_LOCK(switch_bin);
+			if (switch_bin->path_selected_by_tag && switch_bin->last_caps != NULL)
+			{
+				GST_DEBUG_OBJECT(switch_bin, "forcing path selection via caps (last selection was via tags)");
+				gst_switch_bin_select_path_for_caps(switch_bin, switch_bin->last_caps);
+			}
+			PATH_UNLOCK(switch_bin);
+
 			return gst_pad_event_default(pad, parent, event);
 		}
 
@@ -304,6 +325,30 @@ static gboolean gst_switch_bin_sink_event(GstPad *pad, GstObject *parent, GstEve
 
 			PATH_LOCK(switch_bin);
 			ret = gst_switch_bin_select_path_for_caps(switch_bin, caps);
+			PATH_UNLOCK(switch_bin);
+
+			if (!ret)
+			{
+				gst_event_unref(event);
+				return FALSE;
+			}
+			else
+				return gst_pad_event_default(pad, parent, event);
+		}
+
+		case GST_EVENT_TAG:
+		{
+			/* Intercept the tag event to switch to an appropriate path, then
+			 * resume default tag event processing */
+
+			GstTagList *tags;
+			gboolean ret;
+
+			gst_event_parse_tag(event, &tags);
+			GST_DEBUG_OBJECT(switch_bin, "sink pad got tag event with tags %" GST_PTR_FORMAT " ; looking for matching path", (gpointer)tags);
+
+			PATH_LOCK(switch_bin);
+			ret = gst_switch_bin_select_path_for_tags(switch_bin, tags);
 			PATH_UNLOCK(switch_bin);
 
 			if (!ret)
@@ -546,6 +591,55 @@ static gboolean gst_switch_bin_select_path_for_caps(GstSwitchBin *switch_bin, Gs
 	return ret;
 }
 
+static gboolean gst_switch_bin_select_path_for_tags(GstSwitchBin *switch_bin, GstTagList *tags)
+{
+	/* must be called with path lock held */
+
+	gboolean ret = FALSE;
+	GstSwitchBinPath *path;
+
+	/* One difference to the caps-based switching is that if no
+	 * matching path is found, no error message is generated. This is
+	 * because tags may or may not be present, but caps _must_ exist
+	 * (otherwise, using switchbin makes little sense).
+	 *
+	 * The tag basedswitching is meant as a refinement to the caps based
+	 * one. Initially, switchbin can switch to a path based on the caps,
+	 * and later switch again based on tags. This also means that prior
+	 * to attempting to switch based on tags, a path has been already
+	 * selected, so if the tag match fails, the dataflow can continue
+	 * through the currently selected path.
+	 *
+	 * But in case of caps based switching, a current path may not yet
+	 * exist. This can happen if the initial caps do not match for
+	 * example. Playback starts, the first stream-start, caps, and
+	 * segment events make their way downstream, and then switchbin
+	 * finds no path with matching caps. Result: stream cannot continue,
+	 * since switchbin can't find a matching a path, and has no current
+	 * path set.
+	 *
+	 * For this reason, a match failure is an error with caps-based
+	 * switchbin, but not with tag-based switching. */
+
+	path = gst_switch_bin_find_matching_path_tags(switch_bin, tags);
+	if (path)
+	{
+		/* Matching path found. Try to switch to it. */
+
+		GST_DEBUG_OBJECT(switch_bin, "found matching path \"%s\" (%p) - switching", GST_OBJECT_NAME(path), (gpointer)path);
+		ret = gst_switch_bin_switch_to_path(switch_bin, path);
+
+		/* If we successfully switched based on tags, remember
+		 * this so we can handle any future stream-start event
+		 * properly. see the GST_EVENT_STREAM_START handler
+		 * for more details. */
+		if (ret)
+			switch_bin->path_selected_by_tag = TRUE;
+	}
+
+	return ret;
+}
+
 
 static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitchBinPath *switch_bin_path)
 {
@@ -674,6 +768,12 @@ static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitc
 		gst_switch_bin_set_sinkpad_block(switch_bin, FALSE);
 
 finish:
+	/* Reset the path_selected_by_tag flag in case it was left
+	 * at TRUE earlier. Any callers who switched to this path
+	 * based on tags anyway explicitely set it back to TRUE again. */
+	if (ret)
+		switch_bin->path_selected_by_tag = FALSE;
+
 	return ret;
 }
 
@@ -687,9 +787,96 @@ static GstSwitchBinPath* gst_switch_bin_find_matching_path(GstSwitchBin *switch_
 	for (i = 0; i < switch_bin->num_paths; ++i)
 	{
 		GstSwitchBinPath *path = switch_bin->paths[i];
+
+		if (path->tags != NULL)
+		{
+			GST_DEBUG_OBJECT(switch_bin, "skipping path %d caps check (tags specified)", i);
+			continue;
+		}
+
+		GST_DEBUG_OBJECT(switch_bin, "checking if caps %" GST_PTR_FORMAT " of path #%u match with input caps %" GST_PTR_FORMAT, (gpointer)(path->caps), i, (gpointer)caps);
+
+		if ((path->caps == NULL) || gst_caps_is_empty(path->caps))
+			continue;
+
+		if (gst_caps_is_any(path->caps))
+		{
+			GST_DEBUG_OBJECT(switch_bin, "choosing path (any) %d", i);
+			return path;
+		}
+
 		if (gst_caps_can_intersect(caps, path->caps))
 			return path;
 	}
+
+	GST_DEBUG_OBJECT(switch_bin, "not choosing any path!");
+	return NULL;
+}
+
+
+typedef struct
+{
+	GstTagList const *input_tags;
+	gboolean match;
+}
+MatchTagRet;
+
+
+static void check_tag_match(const GstTagList *path_tags, const gchar *tag, gpointer user_data)
+{
+	gchar *itag_val = NULL;
+	gchar *ptag_val = NULL;
+	MatchTagRet *tag_ret = (MatchTagRet *) user_data;
+
+	/* If we already found a match, don't check anymore */
+	if (tag_ret->match)
+		return;
+
+	if (gst_tag_list_get_string_index(path_tags, tag, 0, &ptag_val) && ptag_val)
+	{
+		if (gst_tag_list_get_string_index(tag_ret->input_tags, tag, 0, &itag_val) && itag_val)
+		{
+			tag_ret->match = (strstr(itag_val, ptag_val) != NULL);
+			GST_DEBUG("input tag: '%s'  path tag: '%s'  match: %d", itag_val, ptag_val, tag_ret->match);
+		}
+	}
+
+	g_free(itag_val);
+	g_free(ptag_val);
+
+	return;
+}
+
+
+
+static GstSwitchBinPath* gst_switch_bin_find_matching_path_tags(GstSwitchBin *switch_bin, GstTagList const *tags)
+{
+	/* must be called with path lock held */
+
+	guint i;
+
+	for (i = 0; i < switch_bin->num_paths; ++i)
+	{
+		MatchTagRet match;
+		GstSwitchBinPath *path = switch_bin->paths[i];
+
+		if (path->tags == NULL)
+			continue;
+
+		match.input_tags = tags;
+		match.match = FALSE;
+
+		/* Search for matching tags */
+		gst_tag_list_foreach(path->tags, check_tag_match, (gpointer)&match);
+
+		if (match.match)
+		{
+			GST_DEBUG_OBJECT(switch_bin, "path %d has tags that match %" GST_PTR_FORMAT, i, (gpointer)tags);
+			return path;
+		}
+	}
+
+	GST_DEBUG_OBJECT(switch_bin, "did not find any path with tags that match %" GST_PTR_FORMAT, (gpointer)tags);
 
 	return NULL;
 }
@@ -902,7 +1089,8 @@ enum
 {
 	PROP_PATH_0,
 	PROP_ELEMENT,
-	PROP_PATH_CAPS
+	PROP_PATH_CAPS,
+	PROP_PATH_TAGS
 };
 
 
@@ -947,6 +1135,19 @@ static void gst_switch_bin_path_class_init(GstSwitchBinPathClass *klass)
 			G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
 		)
 	);
+	g_object_class_install_property(
+		object_class,
+		PROP_PATH_TAGS,
+		g_param_spec_string(
+			"tags",
+			"Tags",
+			"Tags - specify in format type|value;type|value - if any of the value (of given tags type) "
+			"is found as substring in incoming tags, select this path as the active one",
+			"",
+			G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS
+		)
+	);
+
 }
 
 
@@ -954,6 +1155,8 @@ static void gst_switch_bin_path_init(GstSwitchBinPath *switch_bin_path)
 {
 	switch_bin_path->caps = gst_caps_new_any();
 	switch_bin_path->element = NULL;
+	switch_bin_path->tags = NULL;
+	switch_bin_path->tags_str = NULL;
 	switch_bin_path->bin = NULL;
 }
 
@@ -968,16 +1171,62 @@ static void gst_switch_bin_path_dispose(GObject *object)
 		switch_bin_path->caps = NULL;
 	}
 
+	if (switch_bin_path->tags != NULL)
+	{
+		gst_tag_list_unref(switch_bin_path->tags);
+		switch_bin_path->tags = NULL;
+	}
+
 	if (switch_bin_path->element != NULL)
 	{
 		gst_switch_bin_path_use_new_element(switch_bin_path, NULL);
 	}
+
+	g_free(switch_bin_path->tags_str);
 
 	/* element is managed by the bin itself */
 
 	G_OBJECT_CLASS(gst_switch_bin_path_parent_class)->dispose(object);
 }
 
+static GstTagList *parse_prop_tags_string(const gchar *tags_str)
+{
+	gint ii;
+
+	if (strlen(tags_str) == 0)
+		return NULL;
+
+	GstTagList *new_tags = NULL;
+	gchar **tags_pairs = g_strsplit(tags_str, ";", 255);
+	if (tags_pairs != NULL && tags_pairs[0] != NULL)
+	{
+		new_tags = gst_tag_list_new_empty();
+	}
+	else
+	{
+		/* Call g_strfreev() in case tags_pairs is non-NULL but tags_pairs[0] is */
+		g_strfreev(tags_pairs);
+		return NULL;
+	}
+
+	for (ii = 0; tags_pairs[ii] != NULL; ii++)
+	{
+		gchar **tag_pair = g_strsplit(tags_pairs[ii], "|", 2);
+		GST_DEBUG("Parsing pair %s", tags_pairs[ii]);
+		if (tag_pair[0] && tag_pair[1])
+		{
+			GST_DEBUG("split pair into key %s and value %s", tag_pair[0], tag_pair[1]);
+			GValue tag_val = G_VALUE_INIT;
+			g_value_init(&tag_val, G_TYPE_STRING);
+			g_value_set_string(&tag_val, tag_pair[1]);
+			gst_tag_list_add_value(new_tags, GST_TAG_MERGE_REPLACE, tag_pair[0], &tag_val);
+		}
+		g_strfreev(tag_pair);
+	}
+	g_strfreev(tags_pairs);
+
+	return new_tags;
+}
 
 static void gst_switch_bin_path_set_property(GObject *object, guint prop_id, GValue const *value, GParamSpec *pspec)
 {
@@ -1023,6 +1272,30 @@ static void gst_switch_bin_path_set_property(GObject *object, guint prop_id, GVa
 			break;
 		}
 
+		case PROP_PATH_TAGS:
+		{
+			GstTagList *old_tags;
+			GstTagList *new_tags;
+			gchar *old_tags_str;
+			const gchar *tags_str = g_value_get_string(value);
+
+			new_tags = parse_prop_tags_string(tags_str);
+
+			GST_OBJECT_LOCK(switch_bin_path);
+			old_tags = switch_bin_path->tags;
+			old_tags_str = switch_bin_path->tags_str;
+			switch_bin_path->tags = new_tags;
+			switch_bin_path->tags_str = g_strdup(tags_str);
+			GST_OBJECT_UNLOCK(switch_bin_path);
+
+			if (old_tags != NULL)
+				gst_tag_list_unref(old_tags);
+
+			g_free(old_tags_str);
+
+			break;
+		}
+
 		default:
 			G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
 			break;
@@ -1051,6 +1324,12 @@ static void gst_switch_bin_path_get_property(GObject *object, guint prop_id, GVa
 		case PROP_PATH_CAPS:
 			GST_OBJECT_LOCK(switch_bin_path);
 			gst_value_set_caps(value, switch_bin_path->caps);
+			GST_OBJECT_UNLOCK(switch_bin_path);
+			break;
+
+		case PROP_PATH_TAGS:
+			GST_OBJECT_LOCK(switch_bin_path);
+			g_value_set_string(value, switch_bin_path->tags_str);
 			GST_OBJECT_UNLOCK(switch_bin_path);
 			break;
 

@@ -51,6 +51,7 @@ struct _GstSwitchBin
 	GstSwitchBinPath **paths;
 	GstSwitchBinPath *current_path;
 	guint num_paths;
+	gboolean path_selected_by_tag;
 
 	GstElement *input_identity;
 	GstEvent *last_stream_start;
@@ -73,6 +74,8 @@ struct _GstSwitchBinPath
 
 	GstElement *element;
 	GstCaps *caps;
+	GstTagList *tags;
+	gchar *tags_str;
 	GstSwitchBin *bin;
 };
 
