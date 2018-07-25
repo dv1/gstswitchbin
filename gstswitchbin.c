@@ -101,6 +101,8 @@ static GstPadProbeReturn gst_switch_bin_blocking_pad_probe(GstPad *pad, GstPadPr
 static void gst_switch_bin_set_sinkpad_drop(GstSwitchBin *switch_bin, gboolean do_drop);
 static GstPadProbeReturn gst_switch_bin_dropping_pad_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
 
+static GstPadProbeReturn gst_switch_bin_eos_drop_probe(GstPad *pad, GstPadProbeInfo *info, gpointer user_data);
+
 static GstCaps* gst_switch_bin_get_allowed_caps(GstSwitchBin *switch_bin, gchar const *pad_name, GstCaps *filter);
 static gboolean gst_switch_bin_are_caps_acceptable(GstSwitchBin *switch_bin, GstCaps const *caps);
 
@@ -670,12 +672,25 @@ static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitc
 
 		if (cur_path->element != NULL)
 		{
+			GstPad *sinkpad, srcpad;
+			gulong eos_drop_probe_id;
+
+			GST_DEBUG_OBJECT(switch_bin, "sending EOS to path \"%s\"", GST_OBJECT_NAME(cur_path));
+
+			sinkpad = (GstPad *)(cur_path->element->sinkpads[0].data);
+			srcpad = (GstPad *)(cur_path->element->srcpads[0].data);
+
+			eos_drop_probe_id = gst_pad_add_probe(srcpad, GST_PAD_PROBE_TYPE_DATA_DOWNSTREAM, gst_switch_bin_eos_drop_probe, NULL, NULL);
+
+			gst_pad_send_event(sinkpad, gst_event_new_eos());
+
 			/* Unlock the element's state in case it was locked earlier
 			 * so it can be set to READY */
 			gst_element_set_locked_state(cur_path->element, FALSE);
 			gst_element_set_state(cur_path->element, GST_STATE_READY);
 
-			gst_element_set_state(cur_path->element, GST_STATE_NULL);
+			gst_pad_remove_probe(srcpad, eos_drop_probe_id);
+
 			gst_element_unlink(switch_bin->input_identity, cur_path->element);
 		}
 
@@ -1004,6 +1019,24 @@ static GstPadProbeReturn gst_switch_bin_blocking_pad_probe(G_GNUC_UNUSED GstPad 
 			case GST_EVENT_CAPS:
 			case GST_EVENT_STREAM_START:
 				return GST_PAD_PROBE_PASS;
+			default:
+				break;
+		}
+	}
+
+	return GST_PAD_PROBE_OK;
+}
+
+
+static GstPadProbeReturn gst_switch_bin_eos_drop_probe(G_GNUC_UNUSED GstPad *pad, GstPadProbeInfo *info, G_GNUC_UNUSED gpointer user_data)
+{
+	if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM)
+	{
+		GstEvent *event = GST_PAD_PROBE_INFO_EVENT(info);
+		switch (GST_EVENT_TYPE(event))
+		{
+			case GST_EVENT_EOS:
+				return GST_PAD_PROBE_DROP;
 			default:
 				break;
 		}
