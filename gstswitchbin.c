@@ -671,8 +671,9 @@ static gboolean gst_switch_bin_switch_to_path(GstSwitchBin *switch_bin, GstSwitc
 		if (cur_path->element != NULL)
 		{
 			/* Unlock the element's state in case it was locked earlier
-			 * so it can be set to NULL */
+			 * so it can be set to READY */
 			gst_element_set_locked_state(cur_path->element, FALSE);
+			gst_element_set_state(cur_path->element, GST_STATE_READY);
 
 			gst_element_set_state(cur_path->element, GST_STATE_NULL);
 			gst_element_unlink(switch_bin->input_identity, cur_path->element);
