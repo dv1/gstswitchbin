@@ -121,7 +121,7 @@ static GObject* gst_switch_bin_child_proxy_get_child_by_index(GstChildProxy *chi
 	if (G_UNLIKELY(index >= switch_bin->num_paths))
 		result = NULL;
 	else
-		result = g_object_ref(switch_bin->paths[index]);
+		result = g_object_ref(G_OBJECT(switch_bin->paths[index]));
 
 	PATH_UNLOCK(switch_bin);
 
